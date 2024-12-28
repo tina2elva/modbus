@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	maxRTUFrameLength	int = 256
+	maxRTUFrameLength int = 256
 )
 
 type rtuTransport struct {
@@ -18,13 +18,14 @@ type rtuTransport struct {
 	lastActivity time.Time
 	t35          time.Duration
 	t1           time.Duration
+	lastTxnId    uint16
 }
 
 type rtuLink interface {
-	Close()		(error)
-	Read([]byte)	(int, error)
-	Write([]byte)	(int, error)
-	SetDeadline(time.Time)	(error)
+	Close() error
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	SetDeadline(time.Time) error
 }
 
 // Returns a new RTU transport.
@@ -58,11 +59,11 @@ func (rt *rtuTransport) Close() (err error) {
 // Runs a request across the rtu link and returns a response.
 func (rt *rtuTransport) ExecuteRequest(req *pdu) (res *pdu, err error) {
 	var ts time.Time
-	var t  time.Duration
-	var n  int
+	var t time.Duration
+	var n int
 
 	// set an i/o deadline on the link
-	err	= rt.link.SetDeadline(time.Now().Add(rt.timeout))
+	err = rt.link.SetDeadline(time.Now().Add(rt.timeout))
 	if err != nil {
 		return
 	}
@@ -78,7 +79,8 @@ func (rt *rtuTransport) ExecuteRequest(req *pdu) (res *pdu, err error) {
 
 	// build an RTU ADU out of the request object and
 	// send the final ADU+CRC on the wire
-	n, err	= rt.link.Write(rt.assembleRTUFrame(req))
+	reqData := rt.assembleRTUFrame(req)
+	n, err = rt.link.Write(reqData)
 	if err != nil {
 		return
 	}
@@ -112,7 +114,79 @@ func (rt *rtuTransport) ExecuteRequest(req *pdu) (res *pdu, err error) {
 // Reads a request from the rtu link.
 func (rt *rtuTransport) ReadRequest() (req *pdu, err error) {
 	// reading requests from RTU links is currently unsupported
-	err	= fmt.Errorf("unimplemented")
+	//var txnId uint16
+
+	// set an i/o deadline on the socket (read and write)
+	err = rt.link.SetDeadline(time.Now().Add(rt.timeout))
+	if err != nil {
+		return
+	}
+
+	req, err = rt.readMBAPFrame()
+	if err != nil {
+		return
+	}
+
+	// store the incoming transaction id
+	//rt.lastTxnId = txnId
+
+	return
+}
+
+func (rt *rtuTransport) readMBAPFrame() (p *pdu, err error) {
+	var rxbuf []byte
+	var byteCount int
+	var bytesNeeded int
+	var crc crc
+
+	// read the MBAP header
+	rxbuf = make([]byte, mbapHeaderLength)
+	byteCount, err = io.ReadFull(rt.link, rxbuf)
+	if err != nil {
+		return
+	}
+
+	// figure out how many further bytes to read
+	bytesNeeded, err = expectedRequestLenth(rxbuf[1], uint8(rxbuf[6]))
+	if err != nil {
+		return
+	}
+
+	// never read more than the max allowed frame length
+	if byteCount+bytesNeeded > maxRTUFrameLength {
+		err = ErrProtocolError
+		return
+	}
+
+	rxbuf1 := make([]byte, bytesNeeded)
+	byteCount, err = io.ReadFull(rt.link, rxbuf1)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return
+	}
+	if byteCount != bytesNeeded {
+		rt.logger.Warningf("expected %v bytes, received %v", bytesNeeded, byteCount)
+		err = ErrShortFrame
+		return
+	}
+
+	rxbuf = append(rxbuf, rxbuf1...)
+
+	// compute the CRC on the entire frame, excluding the CRC
+	crc.init()
+	crc.add(rxbuf[0 : 7+bytesNeeded-2])
+
+	// compare CRC values
+	if !crc.isEqual(rxbuf[7+bytesNeeded-2], rxbuf[7+bytesNeeded-1]) {
+		err = ErrBadCRC
+		return
+	}
+
+	p = &pdu{
+		unitId:       rxbuf[0],
+		functionCode: rxbuf[1],
+		// pass the byte count + trailing data as payload, withtout the CRC
+		payload: rxbuf[2 : 7+bytesNeeded-2],
+	}
 
 	return
 }
@@ -123,7 +197,7 @@ func (rt *rtuTransport) WriteResponse(res *pdu) (err error) {
 
 	// build an RTU ADU out of the request object and
 	// send the final ADU+CRC on the wire
-	n, err	= rt.link.Write(rt.assembleRTUFrame(res))
+	n, err = rt.link.Write(rt.assembleRTUFrame(res))
 	if err != nil {
 		return
 	}
@@ -135,16 +209,16 @@ func (rt *rtuTransport) WriteResponse(res *pdu) (err error) {
 
 // Waits for, reads and decodes a frame from the rtu link.
 func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
-	var rxbuf	[]byte
-	var byteCount	int
-	var bytesNeeded	int
-	var crc		crc
+	var rxbuf []byte
+	var byteCount int
+	var bytesNeeded int
+	var crc crc
 
-	rxbuf		= make([]byte, maxRTUFrameLength)
+	rxbuf = make([]byte, maxRTUFrameLength)
 
 	// read the serial ADU header: unit id (1 byte), function code (1 byte) and
 	// PDU length/exception code (1 byte)
-	byteCount, err	= io.ReadFull(rt.link, rxbuf[0:3])
+	byteCount, err = io.ReadFull(rt.link, rxbuf[0:3])
 	if (byteCount > 0 || err == nil) && byteCount != 3 {
 		err = ErrShortFrame
 		return
@@ -160,15 +234,15 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 	}
 
 	// we need to read 2 additional bytes of CRC after the payload
-	bytesNeeded	+= 2
+	bytesNeeded += 2
 
 	// never read more than the max allowed frame length
-	if byteCount + bytesNeeded > maxRTUFrameLength {
-		err	= ErrProtocolError
+	if byteCount+bytesNeeded > maxRTUFrameLength {
+		err = ErrProtocolError
 		return
 	}
 
-	byteCount, err	= io.ReadFull(rt.link, rxbuf[3:3 + bytesNeeded])
+	byteCount, err = io.ReadFull(rt.link, rxbuf[3:3+bytesNeeded])
 	if err != nil && err != io.ErrUnexpectedEOF {
 		return
 	}
@@ -180,19 +254,19 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 
 	// compute the CRC on the entire frame, excluding the CRC
 	crc.init()
-	crc.add(rxbuf[0:3 + bytesNeeded - 2])
+	crc.add(rxbuf[0 : 3+bytesNeeded-2])
 
 	// compare CRC values
-	if !crc.isEqual(rxbuf[3 + bytesNeeded - 2], rxbuf[3 + bytesNeeded - 1]) {
+	if !crc.isEqual(rxbuf[3+bytesNeeded-2], rxbuf[3+bytesNeeded-1]) {
 		err = ErrBadCRC
 		return
 	}
 
-	res	= &pdu{
-		unitId:		rxbuf[0],
-		functionCode:	rxbuf[1],
+	res = &pdu{
+		unitId:       rxbuf[0],
+		functionCode: rxbuf[1],
 		// pass the byte count + trailing data as payload, withtout the CRC
-		payload:	rxbuf[2:3 + bytesNeeded  - 2],
+		payload: rxbuf[2 : 3+bytesNeeded-2],
 	}
 
 	return
@@ -200,19 +274,38 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 
 // Turns a PDU object into bytes.
 func (rt *rtuTransport) assembleRTUFrame(p *pdu) (adu []byte) {
-	var crc		crc
+	var crc crc
 
-	adu	= append(adu, p.unitId)
-	adu	= append(adu, p.functionCode)
-	adu	= append(adu, p.payload...)
+	adu = append(adu, p.unitId)
+	adu = append(adu, p.functionCode)
+	adu = append(adu, p.payload...)
 
 	// run the ADU through the CRC generator
 	crc.init()
 	crc.add(adu)
 
 	// append the CRC to the ADU
-	adu	= append(adu, crc.value()...)
+	adu = append(adu, crc.value()...)
 
+	return
+}
+
+func expectedRequestLenth(requestCode uint8, requestLength uint8) (byteCount int, err error) {
+	switch requestCode {
+	case fcReadHoldingRegisters,
+		fcReadInputRegisters,
+		fcReadCoils,
+		fcReadDiscreteInputs,
+		fcWriteSingleRegister,
+		fcWriteSingleCoil:
+		byteCount = 1
+	case
+		fcWriteMultipleRegisters,
+		fcWriteMultipleCoils:
+		byteCount = int(requestLength) + 2
+	default:
+		err = ErrProtocolError
+	}
 	return
 }
 
@@ -220,24 +313,29 @@ func (rt *rtuTransport) assembleRTUFrame(p *pdu) (adu []byte) {
 func expectedResponseLenth(responseCode uint8, responseLength uint8) (byteCount int, err error) {
 	switch responseCode {
 	case fcReadHoldingRegisters,
-	     fcReadInputRegisters,
-	     fcReadCoils,
-	     fcReadDiscreteInputs:            byteCount = int(responseLength)
+		fcReadInputRegisters,
+		fcReadCoils,
+		fcReadDiscreteInputs:
+		byteCount = int(responseLength)
 	case fcWriteSingleRegister,
-	     fcWriteMultipleRegisters,
-	     fcWriteSingleCoil,
-	     fcWriteMultipleCoils:            byteCount = 3
-	case fcMaskWriteRegister:             byteCount = 5
+		fcWriteMultipleRegisters,
+		fcWriteSingleCoil,
+		fcWriteMultipleCoils:
+		byteCount = 3
+	case fcMaskWriteRegister:
+		byteCount = 5
 	case fcReadHoldingRegisters | 0x80,
-	     fcReadInputRegisters | 0x80,
-	     fcReadCoils | 0x80,
-	     fcReadDiscreteInputs | 0x80,
-	     fcWriteSingleRegister | 0x80,
-	     fcWriteMultipleRegisters | 0x80,
-	     fcWriteSingleCoil | 0x80,
-	     fcWriteMultipleCoils | 0x80,
-	     fcMaskWriteRegister | 0x80:      byteCount = 0
-	default: err = ErrProtocolError
+		fcReadInputRegisters | 0x80,
+		fcReadCoils | 0x80,
+		fcReadDiscreteInputs | 0x80,
+		fcWriteSingleRegister | 0x80,
+		fcWriteMultipleRegisters | 0x80,
+		fcWriteSingleCoil | 0x80,
+		fcWriteMultipleCoils | 0x80,
+		fcMaskWriteRegister | 0x80:
+		byteCount = 0
+	default:
+		err = ErrProtocolError
 	}
 
 	return
